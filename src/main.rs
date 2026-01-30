@@ -160,6 +160,11 @@ struct Stats {
     validation_errors: AtomicU64,
     blocks_scanned: AtomicU64,
     last_hash: RwLock<String>,
+    tipped_staking: AtomicU64,
+    evm_tipped_staking: AtomicU64,
+    max_evm_tip: RwLock<u128>,
+    min_priority: RwLock<Option<u64>>,
+    max_priority: RwLock<Option<u64>>,
 }
 
 impl Stats {
@@ -186,6 +191,39 @@ impl Stats {
             self.blocks_scanned.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    async fn note_tip(&self, tip: u128) {
+        if tip == 0 {
+            return;
+        }
+        self.tipped_staking.fetch_add(1, Ordering::Relaxed);
+    }
+
+    async fn note_evm_tip(&self, tip: u128) {
+        if tip == 0 {
+            return;
+        }
+        self.evm_tipped_staking.fetch_add(1, Ordering::Relaxed);
+        let mut max = self.max_evm_tip.write().await;
+        if tip > *max {
+            *max = tip;
+        }
+    }
+
+    async fn note_priority(&self, priority: u64) {
+        let mut min = self.min_priority.write().await;
+        let mut max = self.max_priority.write().await;
+        match *min {
+            Some(v) if priority < v => *min = Some(priority),
+            None => *min = Some(priority),
+            _ => {}
+        }
+        match *max {
+            Some(v) if priority > v => *max = Some(priority),
+            None => *max = Some(priority),
+            _ => {}
+        }
+    }
 }
 
 impl Default for Stats {
@@ -197,6 +235,11 @@ impl Default for Stats {
             validation_errors: AtomicU64::new(0),
             blocks_scanned: AtomicU64::new(0),
             last_hash: RwLock::new(String::new()),
+            tipped_staking: AtomicU64::new(0),
+            evm_tipped_staking: AtomicU64::new(0),
+            max_evm_tip: RwLock::new(0),
+            min_priority: RwLock::new(None),
+            max_priority: RwLock::new(None),
         }
     }
 }
@@ -387,18 +430,30 @@ async fn process_extrinsic(
 
     stats.inc_staking();
     stats.note_head(&head.hash).await;
+    let tip = extract_tip(metadata, &decoded, &decoded.bytes).unwrap_or(0);
+    let evm_tip = extract_evm_tip(metadata, &decoded, &decoded.bytes).unwrap_or(0);
+    stats.note_tip(tip).await;
+    stats.note_evm_tip(evm_tip).await;
 
-    match validate_priority(client, &head.hash, &decoded.bytes).await {
-        Ok(priority) => {
-            let (baseline_val, elevated) = baseline.check(&top_call, priority);
+    match validate_transaction(client, &head.hash, &decoded.bytes).await {
+        Ok(valid) => {
+            stats.note_priority(valid.priority).await;
+            let (baseline_val, elevated) = baseline.check(&top_call, valid.priority);
             if elevated {
                 stats.inc_elevated();
+            }
+
+            if elevated || tip > 0 || evm_tip > 0 {
                 let ts = now_unix();
                 let blocks_scanned = stats.blocks_scanned.load(Ordering::Relaxed);
                 println!(
-                    "[{ts}] tx={hash_hex} top={top_call} priority={priority} baseline={baseline_val} elevated=true block={} best_hash={} spec_version={} blocks_scanned={} nested={}",
+                    "[{ts}] tx={hash_hex} top={top_call} priority={} baseline={baseline_val} tip={tip} evm_tip={evm_tip} elevated={elevated} requires={} provides={} longevity={} propagate={} block={} spec_version={} blocks_scanned={} nested={}",
+                    valid.priority,
+                    format_tags(&valid.requires),
+                    format_tags(&valid.provides),
+                    valid.longevity,
+                    valid.propagate,
                     head.number,
-                    head.hash,
                     head.spec_version,
                     blocks_scanned,
                     if nested_paths.is_empty() {
@@ -428,12 +483,28 @@ async fn print_status_line_once(stats: &Stats, head_state: &Arc<RwLock<HeadState
     let staking = stats.staking_seen.load(Ordering::Relaxed);
     let elevated = stats.elevated_found.load(Ordering::Relaxed);
     let errors = stats.validation_errors.load(Ordering::Relaxed);
+    let tipped = stats.tipped_staking.load(Ordering::Relaxed);
+    let evm_tipped = stats.evm_tipped_staking.load(Ordering::Relaxed);
+    let max_evm_tip = { *stats.max_evm_tip.read().await };
+    let min_priority = { *stats.min_priority.read().await };
+    let max_priority = { *stats.max_priority.read().await };
     let head = { head_state.read().await.clone() };
     stats.note_head(&head.hash).await;
     let blocks_scanned = stats.blocks_scanned.load(Ordering::Relaxed);
     let line = format!(
-        "\rblock={} best_hash={} spec_version={} blocks_scanned={} seen={} staking={} elevated={} errors={}   ",
-        head.number, head.hash, head.spec_version, blocks_scanned, total, staking, elevated, errors
+        "\rblock={} spec_version={} blocks_scanned={} seen={} staking={} tipped={} evm_tipped={} max_evm_tip={} min_priority={} max_priority={} elevated={} errors={}   ",
+        head.number,
+        head.spec_version,
+        blocks_scanned,
+        total,
+        staking,
+        tipped,
+        evm_tipped,
+        max_evm_tip,
+        min_priority.unwrap_or(0),
+        max_priority.unwrap_or(0),
+        elevated,
+        errors
     );
     let _ = std::io::stdout().write_all(line.as_bytes());
     let _ = std::io::stdout().flush();
@@ -443,8 +514,8 @@ async fn log_error_line(head_state: &Arc<RwLock<HeadState>>, message: &str) {
     let ts = now_unix();
     let head = { head_state.read().await.clone() };
     println!(
-        "[{ts}] error={message} block={} best_hash={} spec_version={}",
-        head.number, head.hash, head.spec_version
+        "[{ts}] error={message} block={} spec_version={}",
+        head.number, head.spec_version
     );
 }
 
@@ -626,6 +697,152 @@ fn collect_from_composite(composite: &Composite<()>, path: &mut Vec<String>, mat
     }
 }
 
+fn extract_tip(
+    metadata: &RuntimeMetadata,
+    decoded: &DecodedExtrinsic,
+    bytes: &[u8],
+) -> Option<u128> {
+    let exts = decoded.ext.transaction_extension_payload()?;
+    for ext in exts.iter() {
+        let range = ext.range();
+        if range.end > bytes.len() {
+            continue;
+        }
+        let ext_bytes = &bytes[range];
+        let value = decode_value(metadata, *ext.ty(), ext_bytes).ok()?;
+        if let Some(tip) = find_tip_in_value(&value) {
+            return Some(tip);
+        }
+    }
+    None
+}
+
+fn extract_evm_tip(
+    metadata: &RuntimeMetadata,
+    decoded: &DecodedExtrinsic,
+    bytes: &[u8],
+) -> Option<u128> {
+    let mut max_tip = 0u128;
+    let keys = [
+        "gas_price",
+        "max_priority_fee_per_gas",
+        "max_fee_per_gas",
+        "gasPrice",
+        "maxPriorityFeePerGas",
+        "maxFeePerGas",
+    ];
+    for arg in decoded.ext.call_data() {
+        let range = arg.range();
+        if range.end > bytes.len() {
+            continue;
+        }
+        let arg_bytes = &bytes[range];
+        let value = match decode_value(metadata, *arg.ty(), arg_bytes) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let tip = find_named_u128_in_value(&value, &keys);
+        if tip > max_tip {
+            max_tip = tip;
+        }
+    }
+    if max_tip > 0 {
+        Some(max_tip)
+    } else {
+        None
+    }
+}
+
+fn find_named_u128_in_value(value: &Value<()>, keys: &[&str]) -> u128 {
+    match &value.value {
+        ValueDef::Composite(Composite::Named(fields)) => {
+            let mut best = 0u128;
+            for (name, val) in fields {
+                if keys.iter().any(|k| k.eq_ignore_ascii_case(name)) {
+                    if let Some(n) = extract_u128(val) {
+                        if n > best {
+                            best = n;
+                        }
+                    }
+                }
+                let sub = find_named_u128_in_value(val, keys);
+                if sub > best {
+                    best = sub;
+                }
+            }
+            best
+        }
+        ValueDef::Composite(Composite::Unnamed(values)) => {
+            values
+                .iter()
+                .map(|v| find_named_u128_in_value(v, keys))
+                .max()
+                .unwrap_or(0)
+        }
+        ValueDef::Variant(variant) => {
+            let wrapped = Value::without_context(ValueDef::Composite(variant.values.clone()));
+            find_named_u128_in_value(&wrapped, keys)
+        }
+        _ => 0,
+    }
+}
+
+fn find_tip_in_value(value: &Value<()>) -> Option<u128> {
+    match &value.value {
+        ValueDef::Composite(Composite::Named(fields)) => {
+            for (name, val) in fields {
+                if name.eq_ignore_ascii_case("tip") {
+                    if let Some(tip) = extract_u128(val) {
+                        return Some(tip);
+                    }
+                }
+                if let Some(tip) = find_tip_in_value(val) {
+                    return Some(tip);
+                }
+            }
+        }
+        ValueDef::Composite(Composite::Unnamed(values)) => {
+            for val in values {
+                if let Some(tip) = find_tip_in_value(val) {
+                    return Some(tip);
+                }
+            }
+        }
+        ValueDef::Variant(variant) => {
+            if let Some(tip) = find_tip_in_value(&Value::without_context(ValueDef::Composite(
+                variant.values.clone(),
+            ))) {
+                return Some(tip);
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+fn extract_u128(value: &Value<()>) -> Option<u128> {
+    match &value.value {
+        ValueDef::Primitive(p) => p.as_u128().or_else(|| match p {
+            scale_value::Primitive::U256(bytes) => {
+                let mut high = [0u8; 16];
+                high.copy_from_slice(&bytes[..16]);
+                if high.iter().any(|b| *b != 0) {
+                    return None;
+                }
+                let mut low = [0u8; 16];
+                low.copy_from_slice(&bytes[16..]);
+                Some(u128::from_be_bytes(low))
+            }
+            scale_value::Primitive::String(s) => {
+                let trimmed = s.strip_prefix("0x").unwrap_or(s);
+                u128::from_str_radix(trimmed, 16).ok().or_else(|| s.parse::<u128>().ok())
+            }
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
 async fn fetch_metadata(client: &WsClient) -> Result<RuntimeMetadata> {
     let metadata_hex: String = client
         .request("state_getMetadata", rpc_params![])
@@ -641,30 +858,45 @@ async fn fetch_metadata(client: &WsClient) -> Result<RuntimeMetadata> {
 }
 
 
-async fn validate_priority(
+async fn validate_transaction(
     client: &WsClient,
     block_hash_hex: &str,
     extrinsic_bytes: &[u8],
-) -> Result<u64> {
+) -> Result<TransactionValid> {
     let block_hash = decode_hash32(block_hash_hex)?;
     let params_v3 = encode_validate_params(extrinsic_bytes, Some(&block_hash));
     if let Ok(response) = state_call(client, VALIDATION_METHOD, &params_v3, block_hash_hex).await {
         if let Ok(result) = decode_validation_result(&response) {
             return match result {
-                ValidationResult::Valid(valid) => Ok(valid.priority),
+                ValidationResult::Valid(valid) => Ok(valid),
                 ValidationResult::Invalid(err) => Err(anyhow!("transaction invalid: {err:?}")),
                 ValidationResult::Unknown(err) => Err(anyhow!("transaction unknown: {err:?}")),
             };
         }
     }
 
-    // Fallback to legacy signature (v2) without block hash.
     let params_v2 = encode_validate_params(extrinsic_bytes, None);
     let response = state_call(client, VALIDATION_METHOD, &params_v2, block_hash_hex).await?;
     match decode_validation_result(&response)? {
-        ValidationResult::Valid(valid) => Ok(valid.priority),
+        ValidationResult::Valid(valid) => Ok(valid),
         ValidationResult::Invalid(err) => Err(anyhow!("transaction invalid: {err:?}")),
         ValidationResult::Unknown(err) => Err(anyhow!("transaction unknown: {err:?}")),
+    }
+}
+
+fn format_tags(tags: &[Vec<u8>]) -> String {
+    if tags.is_empty() {
+        return "0".to_string();
+    }
+    let preview: Vec<String> = tags
+        .iter()
+        .take(3)
+        .map(|t| format!("0x{}", hex::encode(t)))
+        .collect();
+    if tags.len() <= 3 {
+        format!("{}", preview.join(","))
+    } else {
+        format!("{}+{}", preview.join(","), tags.len() - 3)
     }
 }
 
