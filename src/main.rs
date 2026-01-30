@@ -8,16 +8,20 @@ use jsonrpsee::{
     ws_client::WsClientBuilder,
 };
 use parity_scale_codec::{Compact, Decode, Encode};
-use scale_value::{Composite, Value, ValueDef};
 use scale_value::scale;
+use scale_value::{Composite, Value, ValueDef};
 use serde::Deserialize;
 use sp_crypto_hashing::blake2_256;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::Write;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use subxt::config::SubstrateConfig;
+use subxt::utils::{AccountId32, MultiAddress};
+use subxt::OnlineClient;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 
@@ -31,6 +35,8 @@ struct Config {
     baseline_priority: u64,
     auto_baseline: bool,
     from_past_block: Option<u64>,
+    inspect_account: Option<String>,
+    inspect_blocks: u64,
 }
 
 impl Config {
@@ -40,6 +46,8 @@ impl Config {
         let mut baseline_priority = 0u64;
         let mut auto_baseline = true;
         let mut from_past_block = None;
+        let mut inspect_account = None;
+        let mut inspect_blocks = 200u64;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -62,6 +70,14 @@ impl Config {
                     let val = args.next().context("--from-past-block requires a value")?;
                     from_past_block = Some(val.parse().context("invalid --from-past-block")?);
                 }
+                "--inspect-account" => {
+                    let val = args.next().context("--inspect-account requires a value")?;
+                    inspect_account = Some(val);
+                }
+                "--inspect-blocks" => {
+                    let val = args.next().context("--inspect-blocks requires a value")?;
+                    inspect_blocks = val.parse().context("invalid --inspect-blocks")?;
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -81,6 +97,8 @@ impl Config {
             baseline_priority,
             auto_baseline,
             from_past_block,
+            inspect_account,
+            inspect_blocks,
         })
     }
 }
@@ -96,6 +114,8 @@ fn print_usage() {
     println!("  --auto-baseline             Enable auto baseline (default)");
     println!("  --no-auto-baseline          Disable auto baseline");
     println!("  --from-past-block <U64>     Scan historical blocks from this height, then continue live");
+    println!("  --inspect-account <SS58>    Inspect recent blocks for transactions involving this account");
+    println!("  --inspect-blocks <U64>      Blocks to scan for --inspect-account (default: 200)");
     println!("  -h, --help                  Show this help");
 }
 
@@ -257,6 +277,11 @@ struct DecodedExtrinsic {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_args()?;
+
+    if let Some(account) = config.inspect_account.as_deref() {
+        inspect_account(&config.ws_url, account, config.inspect_blocks).await?;
+        return Ok(());
+    }
 
     let client = Arc::new(
         WsClientBuilder::default()
@@ -580,6 +605,10 @@ async fn process_extrinsic_with_source(
         }
     };
 
+    // Track EVM tips for all transactions once decoded.
+    let evm_tip = extract_evm_tip(metadata, &decoded, &decoded.bytes).unwrap_or(0);
+    stats.note_evm_tip(evm_tip);
+
     let top_call = format!("{}::{}", decoded.ext.pallet_name(), decoded.ext.call_name());
     let top_is_stake = is_stake_name(decoded.ext.call_name());
 
@@ -594,9 +623,7 @@ async fn process_extrinsic_with_source(
 
     stats.inc_staking();
     let tip = extract_tip(metadata, &decoded, &decoded.bytes).unwrap_or(0);
-    let evm_tip = extract_evm_tip(metadata, &decoded, &decoded.bytes).unwrap_or(0);
     stats.note_tip(tip).await;
-    stats.note_evm_tip(evm_tip);
 
     let validate_hash = validation_hash.as_deref().unwrap_or(&head.hash);
     match validate_transaction(client, validate_hash, &decoded.bytes, source).await {
@@ -768,6 +795,272 @@ fn format_eta(secs: u64) -> String {
     let minutes = (secs % 3600) / 60;
     let seconds = secs % 60;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+async fn inspect_account(ws_url: &str, account: &str, blocks_back: u64) -> Result<()> {
+    let target = AccountId32::from_str(account).context("invalid SS58 account")?;
+    let target_bytes = target.0;
+    let client = OnlineClient::<SubstrateConfig>::from_url(ws_url)
+        .await
+        .context("failed to connect via subxt")?;
+
+    let latest = client.blocks().at_latest().await?;
+    let latest_number = latest.header().number;
+    let mut hashes = Vec::new();
+    let mut current_hash = latest.hash();
+
+    let mut remaining = blocks_back.max(1);
+    while remaining > 0 {
+        let block = client.blocks().at(current_hash).await?;
+        let header = block.header();
+        hashes.push((header.number, current_hash));
+        if header.number == 0 {
+            break;
+        }
+        current_hash = header.parent_hash;
+        remaining -= 1;
+    }
+
+    hashes.sort_by_key(|(number, _)| *number);
+    let start = hashes.first().map(|(n, _)| *n).unwrap_or(latest_number);
+    let end = hashes.last().map(|(n, _)| *n).unwrap_or(latest_number);
+    println!(
+        "Inspecting account {} in blocks {}..={} ({} blocks) via {}",
+        target,
+        start,
+        end,
+        hashes.len(),
+        ws_url
+    );
+
+    let mut match_count = 0u64;
+    for (number, hash) in hashes {
+        let block = client.blocks().at(hash).await?;
+        let extrinsics = block.extrinsics().await?;
+        for ext in extrinsics.iter() {
+            if !ext.is_signed() {
+                continue;
+            }
+
+            let signer = ext.address_bytes().and_then(decode_subxt_address);
+            let mut matched = false;
+            let mut reasons: Vec<String> = Vec::new();
+
+            if signer.as_ref() == Some(&target) {
+                matched = true;
+                reasons.push("signer".to_string());
+            }
+
+            let mut field_matches = Vec::new();
+            let mut nested_call = None;
+            if let Ok(fields) = ext.field_values() {
+                collect_account_matches_in_composite(
+                    &fields,
+                    &target_bytes,
+                    &mut Vec::new(),
+                    &mut field_matches,
+                );
+                nested_call = extract_call_path_from_fields(&fields);
+            }
+
+            if !field_matches.is_empty() {
+                matched = true;
+                reasons.push(format!("fields={}", field_matches.join(",")));
+            }
+
+            if matched {
+                match_count += 1;
+                let pallet = ext.pallet_name().unwrap_or("-");
+                let call = ext.variant_name().unwrap_or("-");
+                let hash_hex = format!("0x{}", hex::encode(ext.hash()));
+                let signer_str = signer
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "-".to_string());
+                let nested_call = nested_call.unwrap_or_else(|| "-".to_string());
+
+                println!(
+                    "block={} index={} hash={} signer={} call={}::{} nested_call={} reasons={}",
+                    number,
+                    ext.index(),
+                    hash_hex,
+                    signer_str,
+                    pallet,
+                    call,
+                    nested_call,
+                    reasons.join(";")
+                );
+            }
+        }
+    }
+
+    println!("Found {} matching extrinsics.", match_count);
+    Ok(())
+}
+
+fn decode_subxt_address(bytes: &[u8]) -> Option<AccountId32> {
+    let mut cursor = bytes;
+    let address = MultiAddress::<AccountId32, u32>::decode(&mut cursor).ok()?;
+    match address {
+        MultiAddress::Id(id) => Some(id),
+        _ => None,
+    }
+}
+
+fn extract_call_path_from_fields<C>(composite: &Composite<C>) -> Option<String> {
+    match composite {
+        Composite::Named(fields) => {
+            for (name, value) in fields {
+                if name == "call" {
+                    if let Some(path) = extract_call_path_from_value(value) {
+                        return Some(path);
+                    }
+                }
+            }
+            for (_, value) in fields {
+                if let Some(path) = extract_call_path_from_value(value) {
+                    return Some(path);
+                }
+            }
+            None
+        }
+        Composite::Unnamed(values) => {
+            for value in values {
+                if let Some(path) = extract_call_path_from_value(value) {
+                    return Some(path);
+                }
+            }
+            None
+        }
+    }
+}
+
+fn extract_call_path_from_value<C>(value: &Value<C>) -> Option<String> {
+    match &value.value {
+        ValueDef::Variant(variant) => {
+            let name = variant.name.clone();
+            if let Some(inner) = first_variant_in_composite(&variant.values) {
+                Some(format!("{name}::{inner}"))
+            } else {
+                Some(name)
+            }
+        }
+        ValueDef::Composite(composite) => first_variant_in_composite(composite),
+        _ => None,
+    }
+}
+
+fn first_variant_in_composite<C>(composite: &Composite<C>) -> Option<String> {
+    match composite {
+        Composite::Named(fields) => {
+            for (_, value) in fields {
+                if let Some(path) = extract_call_path_from_value(value) {
+                    return Some(path);
+                }
+            }
+            None
+        }
+        Composite::Unnamed(values) => {
+            for value in values {
+                if let Some(path) = extract_call_path_from_value(value) {
+                    return Some(path);
+                }
+            }
+            None
+        }
+    }
+}
+
+fn collect_account_matches_in_composite<C>(
+    composite: &Composite<C>,
+    target: &[u8; 32],
+    path: &mut Vec<String>,
+    matches: &mut Vec<String>,
+) {
+    if let Some(bytes) = composite_as_u8_32(composite) {
+        if &bytes == target {
+            push_account_match(path, matches);
+        }
+    }
+
+    match composite {
+        Composite::Named(fields) => {
+            for (name, value) in fields {
+                path.push(name.clone());
+                collect_account_matches_in_value(value, target, path, matches);
+                path.pop();
+            }
+        }
+        Composite::Unnamed(values) => {
+            for (idx, value) in values.iter().enumerate() {
+                path.push(format!("#{idx}"));
+                collect_account_matches_in_value(value, target, path, matches);
+                path.pop();
+            }
+        }
+    }
+}
+
+fn collect_account_matches_in_value<C>(
+    value: &Value<C>,
+    target: &[u8; 32],
+    path: &mut Vec<String>,
+    matches: &mut Vec<String>,
+) {
+    match &value.value {
+        ValueDef::Variant(variant) => {
+            path.push(variant.name.clone());
+            collect_account_matches_in_composite(&variant.values, target, path, matches);
+            path.pop();
+        }
+        ValueDef::Composite(composite) => {
+            collect_account_matches_in_composite(composite, target, path, matches);
+        }
+        ValueDef::Primitive(scale_value::Primitive::U256(bytes))
+        | ValueDef::Primitive(scale_value::Primitive::I256(bytes)) => {
+            if bytes.as_slice() == target {
+                push_account_match(path, matches);
+            }
+        }
+        ValueDef::Primitive(scale_value::Primitive::String(value)) => {
+            if let Ok(account) = AccountId32::from_str(value) {
+                if account.0 == *target {
+                    push_account_match(path, matches);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn composite_as_u8_32<C>(composite: &Composite<C>) -> Option<[u8; 32]> {
+    let Composite::Unnamed(values) = composite else {
+        return None;
+    };
+    if values.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (idx, value) in values.iter().enumerate() {
+        match &value.value {
+            ValueDef::Primitive(scale_value::Primitive::U128(byte)) => {
+                if *byte > u8::MAX as u128 {
+                    return None;
+                }
+                out[idx] = *byte as u8;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn push_account_match(path: &[String], matches: &mut Vec<String>) {
+    if path.is_empty() {
+        matches.push("<root>".to_string());
+    } else {
+        matches.push(path.join("."));
+    }
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>> {
@@ -1022,14 +1315,15 @@ fn extract_u128(value: &Value<()>) -> Option<u128> {
     match &value.value {
         ValueDef::Primitive(p) => p.as_u128().or_else(|| match p {
             scale_value::Primitive::U256(bytes) => {
+                // SCALE integers are little-endian.
                 let mut high = [0u8; 16];
-                high.copy_from_slice(&bytes[..16]);
+                high.copy_from_slice(&bytes[16..]);
                 if high.iter().any(|b| *b != 0) {
                     return None;
                 }
                 let mut low = [0u8; 16];
-                low.copy_from_slice(&bytes[16..]);
-                Some(u128::from_be_bytes(low))
+                low.copy_from_slice(&bytes[..16]);
+                Some(u128::from_le_bytes(low))
             }
             scale_value::Primitive::String(s) => {
                 let trimmed = s.strip_prefix("0x").unwrap_or(s);

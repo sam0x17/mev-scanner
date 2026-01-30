@@ -14,4 +14,5 @@ parity-scale-codec = "3"
 scale-value = "0.18"
 sp-crypto-hashing = "0.1"
 serde = { version = "1", features = ["derive"] }
+subxt = "0.44"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
