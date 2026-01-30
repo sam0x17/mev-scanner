@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
+frame-decode = "0.9"
+frame-metadata = "23"
+futures = "0.3"
+hex = "0.4"
+jsonrpsee = { version = "0.24", features = ["ws-client", "macros"] }
+parity-scale-codec = "3"
+scale-value = "0.18"
+sp-crypto-hashing = "0.1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
