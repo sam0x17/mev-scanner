@@ -12,6 +12,8 @@ use scale_value::scale;
 use scale_value::{Composite, Value, ValueDef};
 use serde::Deserialize;
 use sp_crypto_hashing::blake2_256;
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry as DashEntry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::Write;
@@ -193,6 +195,7 @@ struct Stats {
     staking_seen: AtomicU64,
     elevated_found: AtomicU64,
     validation_errors: AtomicU64,
+    replacements_detected: AtomicU64,
     blocks_scanned: AtomicU64,
     tipped_staking: AtomicU64,
     evm_tipped_staking: AtomicU64,
@@ -216,6 +219,10 @@ impl Stats {
 
     fn inc_error(&self) {
         self.validation_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_replacement(&self) {
+        self.replacements_detected.fetch_add(1, Ordering::Relaxed);
     }
 
     async fn note_tip(&self, tip: u128) {
@@ -251,6 +258,17 @@ impl Stats {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ReplacementEntry {
+    hash: String,
+    first_seen: u64,
+}
+
+#[derive(Default)]
+struct ReplacementTracker {
+    by_signer_nonce: DashMap<([u8; 32], u64), ReplacementEntry>,
+}
+
 impl Default for Stats {
     fn default() -> Self {
         Self {
@@ -258,6 +276,7 @@ impl Default for Stats {
             staking_seen: AtomicU64::new(0),
             elevated_found: AtomicU64::new(0),
             validation_errors: AtomicU64::new(0),
+            replacements_detected: AtomicU64::new(0),
             blocks_scanned: AtomicU64::new(0),
             tipped_staking: AtomicU64::new(0),
             evm_tipped_staking: AtomicU64::new(0),
@@ -296,6 +315,7 @@ async fn main() -> Result<()> {
     let mut baseline = Baseline::new(config.baseline_priority, config.auto_baseline);
     let mut seen = Seen::new(2048);
     let stats = Arc::new(Stats::default());
+    let replacements = Arc::new(ReplacementTracker::default());
 
     let updater_client = Arc::clone(&client);
     let updater_head_state = Arc::clone(&head_state);
@@ -328,6 +348,7 @@ async fn main() -> Result<()> {
             &mut baseline,
             &mut seen,
             &stats,
+            &replacements,
             start_block,
         )
         .await?;
@@ -358,6 +379,7 @@ async fn main() -> Result<()> {
                     &mut baseline,
                     &mut seen,
                     &stats,
+                    &replacements,
                     hex,
                 )
                 .await;
@@ -376,6 +398,7 @@ async fn main() -> Result<()> {
                     &mut baseline,
                     &mut seen,
                     &stats,
+                    &replacements,
                 )
                 .await?;
             } else {
@@ -401,6 +424,7 @@ async fn poll_pending_extrinsics(
     baseline: &mut Baseline,
     seen: &mut Seen,
     stats: &Arc<Stats>,
+    replacements: &Arc<ReplacementTracker>,
 ) -> Result<()> {
     let mut ticker = interval(Duration::from_secs(2));
     loop {
@@ -418,6 +442,7 @@ async fn poll_pending_extrinsics(
                 baseline,
                 seen,
                 stats,
+                replacements,
                 hex,
             )
             .await;
@@ -443,6 +468,7 @@ async fn process_extrinsic(
     baseline: &mut Baseline,
     seen: &mut Seen,
     stats: &Arc<Stats>,
+    replacements: &Arc<ReplacementTracker>,
     hex: String,
 ) {
     process_extrinsic_with_source(
@@ -452,6 +478,7 @@ async fn process_extrinsic(
         baseline,
         seen,
         stats,
+        replacements,
         hex,
         TransactionSource::External,
         None,
@@ -466,6 +493,7 @@ async fn scan_past_blocks(
     baseline: &mut Baseline,
     seen: &mut Seen,
     stats: &Arc<Stats>,
+    replacements: &Arc<ReplacementTracker>,
     start_block: u64,
 ) -> Result<()> {
     let current = fetch_head_state(client).await?;
@@ -510,6 +538,7 @@ async fn scan_past_blocks(
                 baseline,
                 seen,
                 stats,
+                replacements,
                 ext,
                 parent_hash.clone(),
             )
@@ -545,6 +574,7 @@ async fn process_extrinsic_with_head(
     baseline: &mut Baseline,
     seen: &mut Seen,
     stats: &Arc<Stats>,
+    replacements: &Arc<ReplacementTracker>,
     hex: String,
     validation_hash: String,
 ) {
@@ -556,6 +586,7 @@ async fn process_extrinsic_with_head(
         baseline,
         seen,
         stats,
+        replacements,
         hex,
         TransactionSource::InBlock,
         Some(validation_hash),
@@ -570,6 +601,7 @@ async fn process_extrinsic_with_source(
     baseline: &mut Baseline,
     seen: &mut Seen,
     stats: &Arc<Stats>,
+    replacements: &Arc<ReplacementTracker>,
     hex: String,
     source: TransactionSource,
     validation_hash: Option<String>,
@@ -604,6 +636,39 @@ async fn process_extrinsic_with_source(
             return;
         }
     };
+
+    if let Some((signer, nonce)) = extract_signer_and_nonce(metadata, &decoded, &decoded.bytes) {
+        let key = (signer, nonce);
+        let entry = replacements.by_signer_nonce.entry(key);
+        match entry {
+            DashEntry::Vacant(vacant) => {
+                vacant.insert(ReplacementEntry {
+                    hash: hash_hex.clone(),
+                    first_seen: now_unix(),
+                });
+            }
+            DashEntry::Occupied(mut occupied) => {
+                let current = occupied.get();
+                if current.hash != hash_hex {
+                    stats.inc_replacement();
+                    let signer_str = AccountId32(signer).to_string();
+                    let ts = now_unix();
+                    let head = { head_state.read().await.clone() };
+                    println!(
+                        "[{ts}] replacement_detected signer={signer_str} nonce={nonce} old_tx={} new_tx={} block={} spec_version={}",
+                        current.hash,
+                        hash_hex,
+                        head.number,
+                        head.spec_version
+                    );
+                    occupied.insert(ReplacementEntry {
+                        hash: hash_hex.clone(),
+                        first_seen: current.first_seen,
+                    });
+                }
+            }
+        }
+    }
 
     // Track EVM tips for all transactions once decoded.
     let evm_tip = extract_evm_tip(metadata, &decoded, &decoded.bytes).unwrap_or(0);
@@ -674,6 +739,7 @@ async fn print_status_line_once(stats: &Stats, head_state: &Arc<RwLock<HeadState
     let staking = stats.staking_seen.load(Ordering::Relaxed);
     let elevated = stats.elevated_found.load(Ordering::Relaxed);
     let errors = stats.validation_errors.load(Ordering::Relaxed);
+    let replacements = stats.replacements_detected.load(Ordering::Relaxed);
     let tipped = stats.tipped_staking.load(Ordering::Relaxed);
     let evm_tipped = stats.evm_tipped_staking.load(Ordering::Relaxed);
     let min_priority = stats.min_priority.load(Ordering::Relaxed);
@@ -684,7 +750,7 @@ async fn print_status_line_once(stats: &Stats, head_state: &Arc<RwLock<HeadState
     let line = if eta_secs != u64::MAX {
         let eta = format_eta(eta_secs);
         format!(
-            "\rblock={} spec_version={} blocks_scanned={} eta={} seen={} staking={} tipped={} evm_tipped={} min_priority={} max_priority={} elevated={} errors={}   ",
+            "\rblock={} spec_version={} blocks_scanned={} eta={} seen={} staking={} tipped={} evm_tipped={} min_priority={} max_priority={} elevated={} replacements={} errors={}   ",
             head.number,
             head.spec_version,
             blocks_scanned,
@@ -696,11 +762,12 @@ async fn print_status_line_once(stats: &Stats, head_state: &Arc<RwLock<HeadState
             if min_priority == u64::MAX { 0 } else { min_priority },
             max_priority,
             elevated,
+            replacements,
             errors
         )
     } else {
         format!(
-            "\rblock={} spec_version={} blocks_scanned={} seen={} staking={} tipped={} evm_tipped={} min_priority={} max_priority={} elevated={} errors={}   ",
+            "\rblock={} spec_version={} blocks_scanned={} seen={} staking={} tipped={} evm_tipped={} min_priority={} max_priority={} elevated={} replacements={} errors={}   ",
             head.number,
             head.spec_version,
             blocks_scanned,
@@ -711,6 +778,7 @@ async fn print_status_line_once(stats: &Stats, head_state: &Arc<RwLock<HeadState
             if min_priority == u64::MAX { 0 } else { min_priority },
             max_priority,
             elevated,
+            replacements,
             errors
         )
     };
@@ -1034,25 +1102,43 @@ fn collect_account_matches_in_value<C>(
 }
 
 fn composite_as_u8_32<C>(composite: &Composite<C>) -> Option<[u8; 32]> {
-    let Composite::Unnamed(values) = composite else {
-        return None;
-    };
+    match composite {
+        Composite::Unnamed(values) => u8_array_from_values(values),
+        Composite::Named(fields) => {
+            if fields.len() != 32 {
+                return None;
+            }
+            let mut out = [0u8; 32];
+            for (idx, (_, value)) in fields.iter().enumerate() {
+                out[idx] = value_as_u8(value)?;
+            }
+            Some(out)
+        }
+    }
+}
+
+fn u8_array_from_values<C>(values: &[Value<C>]) -> Option<[u8; 32]> {
     if values.len() != 32 {
         return None;
     }
     let mut out = [0u8; 32];
     for (idx, value) in values.iter().enumerate() {
-        match &value.value {
-            ValueDef::Primitive(scale_value::Primitive::U128(byte)) => {
-                if *byte > u8::MAX as u128 {
-                    return None;
-                }
-                out[idx] = *byte as u8;
-            }
-            _ => return None,
-        }
+        out[idx] = value_as_u8(value)?;
     }
     Some(out)
+}
+
+fn value_as_u8<C>(value: &Value<C>) -> Option<u8> {
+    match &value.value {
+        ValueDef::Primitive(scale_value::Primitive::U128(byte)) => {
+            if *byte > u8::MAX as u128 {
+                None
+            } else {
+                Some(*byte as u8)
+            }
+        }
+        _ => None,
+    }
 }
 
 fn push_account_match(path: &[String], matches: &mut Vec<String>) {
@@ -1203,6 +1289,133 @@ fn extract_tip(
         let value = decode_value(metadata, *ext.ty(), ext_bytes).ok()?;
         if let Some(tip) = find_tip_in_value(&value) {
             return Some(tip);
+        }
+    }
+    None
+}
+
+fn extract_signer_and_nonce(
+    metadata: &RuntimeMetadata,
+    decoded: &DecodedExtrinsic,
+    bytes: &[u8],
+) -> Option<([u8; 32], u64)> {
+    let signer = extract_signer(metadata, decoded, bytes)?;
+    let nonce = extract_nonce(metadata, decoded, bytes)?;
+    Some((signer, nonce))
+}
+
+fn extract_signer(
+    metadata: &RuntimeMetadata,
+    decoded: &DecodedExtrinsic,
+    bytes: &[u8],
+) -> Option<[u8; 32]> {
+    let sig = decoded.ext.signature_payload()?;
+    let range = sig.address_range();
+    if range.end > bytes.len() {
+        return None;
+    }
+    let addr_bytes = &bytes[range];
+    let value = decode_value(metadata, *sig.address_type(), addr_bytes).ok()?;
+    find_account_id_in_value(&value)
+}
+
+fn extract_nonce(
+    metadata: &RuntimeMetadata,
+    decoded: &DecodedExtrinsic,
+    bytes: &[u8],
+) -> Option<u64> {
+    let exts = decoded.ext.transaction_extension_payload()?;
+    for ext in exts.iter() {
+        let range = ext.range();
+        if range.end > bytes.len() {
+            continue;
+        }
+        let ext_bytes = &bytes[range];
+        let value = decode_value(metadata, *ext.ty(), ext_bytes).ok()?;
+        if let Some(nonce) = find_nonce_in_value(&value) {
+            return Some(nonce);
+        }
+    }
+    None
+}
+
+fn find_nonce_in_value(value: &Value<()>) -> Option<u64> {
+    match &value.value {
+        ValueDef::Composite(Composite::Named(fields)) => {
+            for (name, val) in fields {
+                if name.eq_ignore_ascii_case("nonce") || name.eq_ignore_ascii_case("index") {
+                    if let Some(n) = extract_u128(val) {
+                        if n <= u64::MAX as u128 {
+                            return Some(n as u64);
+                        }
+                    }
+                }
+                if let Some(nonce) = find_nonce_in_value(val) {
+                    return Some(nonce);
+                }
+            }
+        }
+        ValueDef::Composite(Composite::Unnamed(values)) => {
+            for val in values {
+                if let Some(nonce) = find_nonce_in_value(val) {
+                    return Some(nonce);
+                }
+            }
+        }
+        ValueDef::Variant(variant) => {
+            let wrapped = Value::without_context(ValueDef::Composite(variant.values.clone()));
+            if let Some(nonce) = find_nonce_in_value(&wrapped) {
+                return Some(nonce);
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+fn find_account_id_in_value(value: &Value<()>) -> Option<[u8; 32]> {
+    find_account_id_in_value_any(value)
+}
+
+fn find_account_id_in_value_any<C>(value: &Value<C>) -> Option<[u8; 32]> {
+    match &value.value {
+        ValueDef::Variant(variant) => {
+            if variant.name.eq_ignore_ascii_case("id") || variant.name.eq_ignore_ascii_case("accountid32") {
+                if let Some(bytes) = find_account_id_in_composite(&variant.values) {
+                    return Some(bytes);
+                }
+            }
+            find_account_id_in_composite(&variant.values)
+        }
+        ValueDef::Composite(composite) => find_account_id_in_composite(composite),
+        ValueDef::Primitive(scale_value::Primitive::U256(bytes))
+        | ValueDef::Primitive(scale_value::Primitive::I256(bytes)) => Some(*bytes),
+        ValueDef::Primitive(scale_value::Primitive::String(value)) => {
+            AccountId32::from_str(value).ok().map(|id| id.0)
+        }
+        _ => None,
+    }
+}
+
+fn find_account_id_in_composite<C>(composite: &Composite<C>) -> Option<[u8; 32]> {
+    if let Some(bytes) = composite_as_u8_32(composite) {
+        return Some(bytes);
+    }
+
+    match composite {
+        Composite::Named(fields) => {
+            for (_, value) in fields {
+                if let Some(bytes) = find_account_id_in_value_any(value) {
+                    return Some(bytes);
+                }
+            }
+        }
+        Composite::Unnamed(values) => {
+            for value in values {
+                if let Some(bytes) = find_account_id_in_value_any(value) {
+                    return Some(bytes);
+                }
+            }
         }
     }
     None

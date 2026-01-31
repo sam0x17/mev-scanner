@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+dashmap = "6"
 frame-decode = "0.9"
 frame-metadata = "23"
 futures = "0.3"
