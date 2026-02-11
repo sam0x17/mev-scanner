@@ -20,9 +20,11 @@ use std::io::Write;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use subxt::config::SubstrateConfig;
-use subxt::utils::{AccountId32, MultiAddress};
+use subxt::events::Events;
+use subxt::backend::BackendExt;
+use subxt::utils::{AccountId32, H256, MultiAddress};
 use subxt::OnlineClient;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
@@ -39,6 +41,7 @@ struct Config {
     from_past_block: Option<u64>,
     inspect_account: Option<String>,
     inspect_blocks: u64,
+    calculate_transaction_fees: bool,
 }
 
 impl Config {
@@ -50,6 +53,7 @@ impl Config {
         let mut from_past_block = None;
         let mut inspect_account = None;
         let mut inspect_blocks = 200u64;
+        let mut calculate_transaction_fees = false;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -80,6 +84,9 @@ impl Config {
                     let val = args.next().context("--inspect-blocks requires a value")?;
                     inspect_blocks = val.parse().context("invalid --inspect-blocks")?;
                 }
+                "--calculate-transaction-fees" => {
+                    calculate_transaction_fees = true;
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -90,7 +97,7 @@ impl Config {
             }
         }
 
-        if from_past_block.is_some() && !ws_overridden {
+        if (from_past_block.is_some() || calculate_transaction_fees) && !ws_overridden {
             ws_url = ARCHIVE_WS.to_string();
         }
 
@@ -101,6 +108,7 @@ impl Config {
             from_past_block,
             inspect_account,
             inspect_blocks,
+            calculate_transaction_fees,
         })
     }
 }
@@ -118,6 +126,7 @@ fn print_usage() {
     println!("  --from-past-block <U64>     Scan historical blocks from this height, then continue live");
     println!("  --inspect-account <SS58>    Inspect recent blocks for transactions involving this account");
     println!("  --inspect-blocks <U64>      Blocks to scan for --inspect-account (default: 200)");
+    println!("  --calculate-transaction-fees  Sum TransactionPayment fees for the past year and exit");
     println!("  -h, --help                  Show this help");
 }
 
@@ -296,6 +305,16 @@ struct DecodedExtrinsic {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_args()?;
+
+    if config.calculate_transaction_fees {
+        if config.inspect_account.is_some() {
+            return Err(anyhow!(
+                "--calculate-transaction-fees cannot be combined with --inspect-account"
+            ));
+        }
+        calculate_transaction_fees(&config.ws_url).await?;
+        return Ok(());
+    }
 
     if let Some(account) = config.inspect_account.as_deref() {
         inspect_account(&config.ws_url, account, config.inspect_blocks).await?;
@@ -966,6 +985,730 @@ async fn inspect_account(ws_url: &str, account: &str, blocks_back: u64) -> Resul
     Ok(())
 }
 
+async fn calculate_transaction_fees(ws_url: &str) -> Result<()> {
+    println!("Calculating total transaction fees for the past year...");
+
+    let rpc_client = WsClientBuilder::default()
+        .build(ws_url)
+        .await
+        .context("failed to connect to ws endpoint for rpc")?;
+    let api = OnlineClient::<SubstrateConfig>::from_url(ws_url)
+        .await
+        .context("failed to connect via subxt")?;
+
+    let (latest_number, latest_hash) = fetch_latest_block_number_and_hash(&rpc_client).await?;
+    let latest_metadata = fetch_metadata_at(&api, latest_hash).await?;
+    let timestamp_key =
+        resolve_timestamp_storage_key(&latest_metadata).unwrap_or_else(timestamp_storage_key);
+
+    let year_ms = 365u128 * 24 * 60 * 60 * 1000;
+
+    println!("Using endpoint: {}", ws_url);
+
+    let start_block = match fetch_block_timestamp_raw_rpc(
+        &rpc_client,
+        &timestamp_key,
+        &latest_hash,
+    )
+    .await
+    {
+        Ok(latest_ts_raw) => {
+            let timestamp_in_seconds = latest_ts_raw < 1_000_000_000_000u128;
+            let latest_ts_ms = if timestamp_in_seconds {
+                latest_ts_raw * 1000
+            } else {
+                latest_ts_raw
+            };
+            let start_ts_ms = latest_ts_ms.saturating_sub(year_ms);
+            println!(
+                "Latest block: {} timestamp_ms={}{}",
+                latest_number,
+                latest_ts_ms,
+                if timestamp_in_seconds {
+                    " (converted from seconds)"
+                } else {
+                    ""
+                }
+            );
+            println!("Target start timestamp_ms={}", start_ts_ms);
+            match find_block_number_at_or_after_timestamp(
+                &rpc_client,
+                &timestamp_key,
+                start_ts_ms,
+                latest_number,
+                timestamp_in_seconds,
+            )
+            .await
+            {
+                Ok(block) => block,
+                Err(err) => {
+                    let (block_time_ms, source) =
+                        resolve_block_time_ms(&latest_metadata).unwrap_or((12_000, "default"));
+                    let blocks_per_year = year_ms / block_time_ms.max(1);
+                    let start = latest_number.saturating_sub(blocks_per_year as u64);
+                    println!(
+                        "Timestamp search failed: {}. Falling back to estimate.",
+                        err
+                    );
+                    println!(
+                        "Estimated block_time_ms={} source={}",
+                        block_time_ms, source
+                    );
+                    start
+                }
+            }
+        }
+        Err(err) => {
+            let (block_time_ms, source) =
+                resolve_block_time_ms(&latest_metadata).unwrap_or((12_000, "default"));
+            let blocks_per_year = year_ms / block_time_ms.max(1);
+            let start = latest_number.saturating_sub(blocks_per_year as u64);
+            println!(
+                "Latest block: {} (timestamp unavailable: {})",
+                latest_number, err
+            );
+            println!(
+                "Falling back to block-time estimate: block_time_ms={} source={}",
+                block_time_ms, source
+            );
+            start
+        }
+    };
+
+    let total_blocks = latest_number.saturating_sub(start_block) + 1;
+    println!(
+        "Scanning blocks {}..={} ({} blocks)",
+        start_block, latest_number, total_blocks
+    );
+
+    let events_key = system_events_storage_key();
+    let start_hash = fetch_block_hash_h256(&rpc_client, start_block).await?;
+    let mut current_metadata = fetch_metadata_at(&api, start_hash).await?;
+
+    let started = Instant::now();
+    let mut total_fee: u128 = 0;
+    let mut fee_events: u64 = 0;
+    let mut fee_misses: u64 = 0;
+    let mut blocks_processed: u64 = 0;
+
+    for number in start_block..=latest_number {
+        let hash = fetch_block_hash_h256(&rpc_client, number).await?;
+        let event_bytes = fetch_events_bytes(&api, &events_key, hash).await?;
+        let Some(event_bytes) = event_bytes else {
+            fee_misses = fee_misses.saturating_add(1);
+            blocks_processed += 1;
+            continue;
+        };
+
+        let mut result = sum_fees_from_events(&Events::<SubstrateConfig>::decode_from(
+            event_bytes.clone(),
+            current_metadata.clone(),
+        ));
+        if result.had_decode_error {
+            let refreshed = fetch_metadata_at(&api, hash).await?;
+            current_metadata = refreshed;
+            result = sum_fees_from_events(&Events::<SubstrateConfig>::decode_from(
+                event_bytes,
+                current_metadata.clone(),
+            ));
+        }
+
+        total_fee = total_fee.saturating_add(result.total_fee);
+        fee_events = fee_events.saturating_add(result.fee_events);
+        fee_misses = fee_misses.saturating_add(result.fee_misses);
+        blocks_processed += 1;
+
+        if blocks_processed % 250 == 0 || number == latest_number {
+            let elapsed = started.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 {
+                blocks_processed as f64 / elapsed
+            } else {
+                0.0
+            };
+            let remaining = latest_number.saturating_sub(number);
+            let eta = if rate > 0.0 {
+                (remaining as f64 / rate) as u64
+            } else {
+                0
+            };
+            let line = format!(
+                "\rblock={} processed={} fee_events={} fee_misses={} total_fee={} eta={}   ",
+                number,
+                blocks_processed,
+                fee_events,
+                fee_misses,
+                total_fee,
+                format_eta(eta)
+            );
+            let _ = std::io::stdout().write_all(line.as_bytes());
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    println!(
+        "\nTotal transaction fees (raw units): {}",
+        total_fee
+    );
+    if fee_misses > 0 {
+        println!(
+            "Warning: {} fee events could not be decoded; total may be understated.",
+            fee_misses
+        );
+    }
+
+    Ok(())
+}
+
+async fn fetch_block_hash_h256(client: &WsClient, number: u64) -> Result<H256> {
+    let hash: Option<String> = client
+        .request("chain_getBlockHash", rpc_params![number])
+        .await
+        .context("chain_getBlockHash failed")?;
+    let hash = hash.context("block hash not found")?;
+    decode_hash256(&hash)
+}
+
+fn decode_hash256(hash_hex: &str) -> Result<H256> {
+    let bytes = decode_hex(hash_hex)?;
+    if bytes.len() != 32 {
+        return Err(anyhow!(
+            "block hash length is {} (expected 32)",
+            bytes.len()
+        ));
+    }
+    Ok(H256::from_slice(&bytes))
+}
+
+fn system_events_storage_key() -> Vec<u8> {
+    storage_key_from_prefix_entry("System", "Events")
+}
+
+fn timestamp_storage_key() -> Vec<u8> {
+    storage_key_from_prefix_entry("Timestamp", "Now")
+}
+
+fn storage_key_from_prefix_entry(prefix: &str, entry: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(&sp_crypto_hashing::twox_128(prefix.as_bytes()));
+    key.extend_from_slice(&sp_crypto_hashing::twox_128(entry.as_bytes()));
+    key
+}
+
+fn resolve_timestamp_storage_key(
+    metadata: &subxt::metadata::Metadata,
+) -> Option<Vec<u8>> {
+    let mut fallback: Option<Vec<u8>> = None;
+    for pallet in metadata.pallets() {
+        let Some(storage) = pallet.storage() else { continue };
+        let prefix = storage.prefix();
+        for entry in storage.entries() {
+            if !entry.name().eq_ignore_ascii_case("Now") {
+                continue;
+            }
+            let key = storage_key_from_prefix_entry(prefix, entry.name());
+            let pallet_name = pallet.name().to_ascii_lowercase();
+            let prefix_name = prefix.to_ascii_lowercase();
+            if pallet_name.contains("timestamp") || prefix_name.contains("timestamp") {
+                return Some(key);
+            }
+            fallback = Some(key);
+        }
+    }
+    fallback
+}
+
+fn resolve_block_time_ms(metadata: &subxt::metadata::Metadata) -> Option<(u128, &'static str)> {
+    for pallet in metadata.pallets() {
+        let name = pallet.name().to_ascii_lowercase();
+        if !name.contains("timestamp") {
+            continue;
+        }
+        if let Some(constant) = pallet.constant_by_name("MinimumPeriod") {
+            if let Some(value) = decode_constant_u128(metadata, constant) {
+                return Some((value.saturating_mul(2), "Timestamp::MinimumPeriod"));
+            }
+        }
+    }
+
+    for pallet in metadata.pallets() {
+        let name = pallet.name().to_ascii_lowercase();
+        if name == "babe" {
+            if let Some(constant) = pallet.constant_by_name("ExpectedBlockTime") {
+                if let Some(value) = decode_constant_u128(metadata, constant) {
+                    return Some((value, "Babe::ExpectedBlockTime"));
+                }
+            }
+        }
+    }
+
+    for pallet in metadata.pallets() {
+        let name = pallet.name().to_ascii_lowercase();
+        if name == "aura" {
+            if let Some(constant) = pallet.constant_by_name("SlotDuration") {
+                if let Some(value) = decode_constant_u128(metadata, constant) {
+                    return Some((value, "Aura::SlotDuration"));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn decode_constant_u128(
+    metadata: &subxt::metadata::Metadata,
+    constant: &subxt::metadata::types::ConstantMetadata,
+) -> Option<u128> {
+    let value = scale::decode_as_type(
+        &mut &*constant.value(),
+        constant.ty(),
+        metadata.types(),
+    )
+    .ok()?;
+    extract_u128(&value)
+}
+
+fn format_hash_hex(hash: &H256) -> String {
+    format!("0x{}", hex::encode(hash.as_bytes()))
+}
+
+async fn fetch_storage_bytes(
+    client: &WsClient,
+    key: &[u8],
+    hash: &H256,
+) -> Result<Option<Vec<u8>>> {
+    let key_hex = format!("0x{}", hex::encode(key));
+    let hash_hex = format_hash_hex(hash);
+    let response: Option<String> = client
+        .request("state_getStorage", rpc_params![key_hex, hash_hex])
+        .await
+        .context("state_getStorage failed")?;
+    match response {
+        Some(hex) => Ok(Some(decode_hex(&hex)?)),
+        None => Ok(None),
+    }
+}
+
+fn decode_scale_moment(bytes: &[u8]) -> Result<u128> {
+    match bytes.len() {
+        8 => {
+            let mut cursor = &bytes[..];
+            let value = u64::decode(&mut cursor)?;
+            if !cursor.is_empty() {
+                return Err(anyhow!("timestamp decode left trailing bytes"));
+            }
+            Ok(value as u128)
+        }
+        16 => {
+            let mut cursor = &bytes[..];
+            let value = u128::decode(&mut cursor)?;
+            if !cursor.is_empty() {
+                return Err(anyhow!("timestamp decode left trailing bytes"));
+            }
+            Ok(value)
+        }
+        other => Err(anyhow!("unexpected timestamp byte length: {}", other)),
+    }
+}
+
+async fn fetch_block_timestamp_raw_rpc(
+    client: &WsClient,
+    key: &[u8],
+    hash: &H256,
+) -> Result<u128> {
+    if let Some(bytes) = fetch_storage_bytes(client, key, hash).await? {
+        return decode_scale_moment(&bytes).context("failed to decode timestamp bytes");
+    }
+
+    let hash_hex = format_hash_hex(hash);
+    let metadata = fetch_runtime_metadata_at(client, Some(&hash_hex)).await?;
+    fetch_block_timestamp_from_extrinsics(client, &hash_hex, &metadata).await
+}
+
+async fn fetch_block_timestamp_millis_rpc(
+    client: &WsClient,
+    key: &[u8],
+    hash: &H256,
+    timestamp_in_seconds: bool,
+) -> Result<u128> {
+    let raw = fetch_block_timestamp_raw_rpc(client, key, hash).await?;
+    Ok(if timestamp_in_seconds { raw * 1000 } else { raw })
+}
+
+async fn fetch_metadata_at(
+    api: &OnlineClient<SubstrateConfig>,
+    hash: H256,
+) -> Result<subxt::metadata::Metadata> {
+    const METADATA_VERSIONS: [u32; 3] = [16, 15, 14];
+    let backend = api.backend();
+    for version in METADATA_VERSIONS {
+        if let Ok(metadata) = backend.metadata_at_version(version, hash).await {
+            return Ok(metadata);
+        }
+    }
+    backend.legacy_metadata(hash).await.map_err(Into::into)
+}
+
+async fn fetch_events_bytes(
+    api: &OnlineClient<SubstrateConfig>,
+    key: &[u8],
+    hash: H256,
+) -> Result<Option<Vec<u8>>> {
+    let backend = api.backend();
+    backend
+        .storage_fetch_value(key.to_vec(), hash)
+        .await
+        .map_err(Into::into)
+}
+
+async fn fetch_latest_block_number_and_hash(client: &WsClient) -> Result<(u64, H256)> {
+    let hash_hex: String = match client
+        .request("chain_getFinalizedHead", rpc_params![])
+        .await
+    {
+        Ok(hash) => hash,
+        Err(_) => client
+            .request("chain_getBlockHash", rpc_params![])
+            .await
+            .context("chain_getBlockHash failed")?,
+    };
+    let header: HeaderRpc = client
+        .request("chain_getHeader", rpc_params![&hash_hex])
+        .await
+        .context("chain_getHeader failed")?;
+    let number = parse_hex_u64(&header.number)?;
+    let hash = decode_hash256(&hash_hex)?;
+    Ok((number, hash))
+}
+
+async fn fetch_runtime_metadata_at(
+    client: &WsClient,
+    hash_hex: Option<&str>,
+) -> Result<RuntimeMetadata> {
+    let attempt: Result<String, _> = match hash_hex {
+        Some(hash) => client.request("state_getMetadata", rpc_params![hash]).await,
+        None => client.request("state_getMetadata", rpc_params![]).await,
+    };
+    match attempt {
+        Ok(metadata_hex) => decode_runtime_metadata_hex(&metadata_hex),
+        Err(err) => {
+            if hash_hex.is_some() {
+                let fallback: String = client
+                    .request("state_getMetadata", rpc_params![])
+                    .await
+                    .context("state_getMetadata failed")?;
+                return decode_runtime_metadata_hex(&fallback);
+            }
+            Err(anyhow!(err))
+        }
+    }
+}
+
+fn decode_runtime_metadata_hex(metadata_hex: &str) -> Result<RuntimeMetadata> {
+    let metadata_bytes = decode_hex(metadata_hex).context("metadata hex decode failed")?;
+    if let Ok(prefixed) = RuntimeMetadataPrefixed::decode(&mut &metadata_bytes[..]) {
+        if prefixed.0 == META_RESERVED {
+            return Ok(prefixed.1);
+        }
+    }
+    Ok(RuntimeMetadata::decode(&mut &metadata_bytes[..])?)
+}
+
+async fn fetch_block_timestamp_from_extrinsics(
+    client: &WsClient,
+    hash_hex: &str,
+    metadata: &RuntimeMetadata,
+) -> Result<u128> {
+    let block: BlockResponse = client
+        .request("chain_getBlock", rpc_params![hash_hex])
+        .await
+        .context("chain_getBlock failed")?;
+    let mut fallback_large: Option<u128> = None;
+    let mut raw_fallback: Option<u128> = None;
+    for ext in block.block.extrinsics {
+        let raw = match decode_hex(&ext) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let decoded = match decode_extrinsic(metadata, &raw) {
+            Ok(ext) => ext,
+            Err(_) => continue,
+        };
+        let pallet = decoded.ext.pallet_name().to_ascii_lowercase();
+        let call = decoded.ext.call_name().to_ascii_lowercase();
+        let is_timestamp_pallet = pallet.contains("timestamp");
+
+        if is_timestamp_pallet {
+            if let Some(moment) =
+                extract_call_u128(metadata, &decoded, &["now", "moment", "time"])
+            {
+                return Ok(moment);
+            }
+        }
+
+        if decoded.ext.is_signed() {
+            continue;
+        }
+
+        if call.contains("timestamp") || call.contains("set") {
+            if let Some(moment) =
+                extract_call_u128(metadata, &decoded, &["now", "moment", "time"])
+            {
+                if moment >= 1_000_000_000 {
+                    return Ok(moment);
+                }
+                if fallback_large.is_none() {
+                    fallback_large = Some(moment);
+                }
+            }
+        }
+
+        if raw_fallback.is_none() {
+            if let Some(moment) = extract_moment_from_raw_extrinsic(&raw) {
+                if moment >= 1_000_000_000 {
+                    raw_fallback = Some(moment);
+                }
+            }
+        }
+    }
+
+    if let Some(moment) = fallback_large {
+        return Ok(moment);
+    }
+    if let Some(moment) = raw_fallback {
+        return Ok(moment);
+    }
+
+    Err(anyhow!("timestamp extrinsic not found"))
+}
+
+fn extract_call_u128(
+    metadata: &RuntimeMetadata,
+    decoded: &DecodedExtrinsic,
+    preferred_names: &[&str],
+) -> Option<u128> {
+    let mut fallback = None;
+    for arg in decoded.ext.call_data() {
+        let range = arg.range();
+        if range.end > decoded.bytes.len() {
+            continue;
+        }
+        let arg_bytes = &decoded.bytes[range];
+        let value = decode_value(metadata, *arg.ty(), arg_bytes).ok()?;
+        if let Some(n) = extract_u128(&value) {
+            if preferred_names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(arg.name()))
+            {
+                return Some(n);
+            }
+            if fallback.is_none() {
+                fallback = Some(n);
+            }
+        }
+    }
+    fallback
+}
+
+fn extract_moment_from_raw_extrinsic(raw: &[u8]) -> Option<u128> {
+    let bytes = strip_extrinsic_len_prefix(raw);
+    if bytes.len() < 3 {
+        return None;
+    }
+    let version = bytes[0];
+    let is_signed = (version & 0b1000_0000) != 0;
+    if is_signed {
+        return None;
+    }
+    let args = &bytes[3..];
+    if let Some(val) = decode_u128_or_u64(args) {
+        return Some(val);
+    }
+    None
+}
+
+fn strip_extrinsic_len_prefix(raw: &[u8]) -> &[u8] {
+    let mut cursor = raw;
+    if let Ok(Compact(len)) = Compact::<u32>::decode(&mut cursor) {
+        if len as usize == cursor.len() {
+            return cursor;
+        }
+    }
+    raw
+}
+
+fn decode_u128_or_u64(bytes: &[u8]) -> Option<u128> {
+    if bytes.len() >= 16 {
+        let mut cursor = &bytes[..];
+        if let Ok(val) = u128::decode(&mut cursor) {
+            return Some(val);
+        }
+    }
+    if bytes.len() >= 8 {
+        let mut cursor = &bytes[..];
+        if let Ok(val) = u64::decode(&mut cursor) {
+            return Some(val as u128);
+        }
+    }
+    None
+}
+
+async fn find_block_number_at_or_after_timestamp(
+    rpc_client: &WsClient,
+    timestamp_key: &[u8],
+    target_ts_ms: u128,
+    latest_number: u64,
+    timestamp_in_seconds: bool,
+) -> Result<u64> {
+    let genesis_hash = fetch_block_hash_h256(rpc_client, 0).await?;
+    let genesis_ts = fetch_block_timestamp_millis_rpc(
+        rpc_client,
+        timestamp_key,
+        &genesis_hash,
+        timestamp_in_seconds,
+    )
+    .await?;
+    if genesis_ts >= target_ts_ms {
+        return Ok(0);
+    }
+
+    let latest_hash = fetch_block_hash_h256(rpc_client, latest_number).await?;
+    let latest_ts = fetch_block_timestamp_millis_rpc(
+        rpc_client,
+        timestamp_key,
+        &latest_hash,
+        timestamp_in_seconds,
+    )
+    .await?;
+    if latest_ts < target_ts_ms {
+        return Ok(latest_number);
+    }
+
+    let mut low = 0u64;
+    let mut high = latest_number;
+    let mut best = latest_number;
+
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let hash = fetch_block_hash_h256(rpc_client, mid).await?;
+        let ts = fetch_block_timestamp_millis_rpc(
+            rpc_client,
+            timestamp_key,
+            &hash,
+            timestamp_in_seconds,
+        )
+        .await?;
+        if ts >= target_ts_ms {
+            best = mid;
+            if mid == 0 {
+                break;
+            }
+            high = mid - 1;
+        } else {
+            low = mid + 1;
+        }
+    }
+
+    Ok(best)
+}
+
+struct FeeSum {
+    total_fee: u128,
+    fee_events: u64,
+    fee_misses: u64,
+    had_decode_error: bool,
+}
+
+fn sum_fees_from_events(events: &Events<SubstrateConfig>) -> FeeSum {
+    let mut total = 0u128;
+    let mut fee_events = 0u64;
+    let mut fee_misses = 0u64;
+    let mut had_decode_error = false;
+
+    for event in events.iter() {
+        let event = match event {
+            Ok(ev) => ev,
+            Err(_) => {
+                had_decode_error = true;
+                fee_misses += 1;
+                continue;
+            }
+        };
+
+        if !event.pallet_name().eq_ignore_ascii_case("TransactionPayment") {
+            continue;
+        }
+        let variant = event.variant_name();
+        if !variant.eq_ignore_ascii_case("TransactionFeePaid")
+            && !variant.to_ascii_lowercase().contains("feepaid")
+        {
+            continue;
+        }
+
+        fee_events += 1;
+        let fields = match event.field_values() {
+            Ok(fields) => fields,
+            Err(_) => {
+                fee_misses += 1;
+                continue;
+            }
+        };
+        if let Some(fee) = extract_fee_from_transaction_payment_fields(&fields) {
+            total = total.saturating_add(fee);
+        } else {
+            fee_misses += 1;
+        }
+    }
+
+    FeeSum {
+        total_fee: total,
+        fee_events,
+        fee_misses,
+        had_decode_error,
+    }
+}
+
+fn extract_fee_from_transaction_payment_fields<C>(fields: &Composite<C>) -> Option<u128> {
+    match fields {
+        Composite::Named(entries) => {
+            let mut fee: Option<u128> = None;
+            let mut tip: Option<u128> = None;
+            for (name, value) in entries {
+                if name.eq_ignore_ascii_case("actual_fee")
+                    || name.eq_ignore_ascii_case("actualFee")
+                {
+                    return extract_u128(value);
+                }
+                if name.eq_ignore_ascii_case("fee")
+                    || name.eq_ignore_ascii_case("amount")
+                    || name.eq_ignore_ascii_case("partial_fee")
+                {
+                    fee = fee.or_else(|| extract_u128(value));
+                }
+                if name.eq_ignore_ascii_case("tip") {
+                    tip = tip.or_else(|| extract_u128(value));
+                }
+            }
+            if let Some(fee) = fee {
+                return Some(fee.saturating_add(tip.unwrap_or(0)));
+            }
+            None
+        }
+        Composite::Unnamed(values) => {
+            if values.len() < 2 {
+                return None;
+            }
+            let fee = extract_u128(&values[1])?;
+            let tip = if values.len() >= 3 {
+                extract_u128(&values[2]).unwrap_or(0)
+            } else {
+                0
+            };
+            Some(fee.saturating_add(tip))
+        }
+    }
+}
+
 fn decode_subxt_address(bytes: &[u8]) -> Option<AccountId32> {
     let mut cursor = bytes;
     let address = MultiAddress::<AccountId32, u32>::decode(&mut cursor).ok()?;
@@ -1339,9 +2082,17 @@ fn extract_nonce(
     None
 }
 
-fn find_nonce_in_value(value: &Value<()>) -> Option<u64> {
+fn find_nonce_in_value<C>(value: &Value<C>) -> Option<u64> {
     match &value.value {
-        ValueDef::Composite(Composite::Named(fields)) => {
+        ValueDef::Composite(composite) => find_nonce_in_composite(composite),
+        ValueDef::Variant(variant) => find_nonce_in_composite(&variant.values),
+        _ => None,
+    }
+}
+
+fn find_nonce_in_composite<C>(composite: &Composite<C>) -> Option<u64> {
+    match composite {
+        Composite::Named(fields) => {
             for (name, val) in fields {
                 if name.eq_ignore_ascii_case("nonce") || name.eq_ignore_ascii_case("index") {
                     if let Some(n) = extract_u128(val) {
@@ -1355,20 +2106,13 @@ fn find_nonce_in_value(value: &Value<()>) -> Option<u64> {
                 }
             }
         }
-        ValueDef::Composite(Composite::Unnamed(values)) => {
+        Composite::Unnamed(values) => {
             for val in values {
                 if let Some(nonce) = find_nonce_in_value(val) {
                     return Some(nonce);
                 }
             }
         }
-        ValueDef::Variant(variant) => {
-            let wrapped = Value::without_context(ValueDef::Composite(variant.values.clone()));
-            if let Some(nonce) = find_nonce_in_value(&wrapped) {
-                return Some(nonce);
-            }
-        }
-        _ => {}
     }
     None
 }
@@ -1457,9 +2201,17 @@ fn extract_evm_tip(
     }
 }
 
-fn find_named_u128_in_value(value: &Value<()>, keys: &[&str]) -> u128 {
+fn find_named_u128_in_value<C>(value: &Value<C>, keys: &[&str]) -> u128 {
     match &value.value {
-        ValueDef::Composite(Composite::Named(fields)) => {
+        ValueDef::Composite(composite) => find_named_u128_in_composite(composite, keys),
+        ValueDef::Variant(variant) => find_named_u128_in_composite(&variant.values, keys),
+        _ => 0,
+    }
+}
+
+fn find_named_u128_in_composite<C>(composite: &Composite<C>, keys: &[&str]) -> u128 {
+    match composite {
+        Composite::Named(fields) => {
             let mut best = 0u128;
             for (name, val) in fields {
                 if keys.iter().any(|k| k.eq_ignore_ascii_case(name)) {
@@ -1476,24 +2228,25 @@ fn find_named_u128_in_value(value: &Value<()>, keys: &[&str]) -> u128 {
             }
             best
         }
-        ValueDef::Composite(Composite::Unnamed(values)) => {
-            values
-                .iter()
-                .map(|v| find_named_u128_in_value(v, keys))
-                .max()
-                .unwrap_or(0)
-        }
-        ValueDef::Variant(variant) => {
-            let wrapped = Value::without_context(ValueDef::Composite(variant.values.clone()));
-            find_named_u128_in_value(&wrapped, keys)
-        }
-        _ => 0,
+        Composite::Unnamed(values) => values
+            .iter()
+            .map(|v| find_named_u128_in_value(v, keys))
+            .max()
+            .unwrap_or(0),
     }
 }
 
-fn find_tip_in_value(value: &Value<()>) -> Option<u128> {
+fn find_tip_in_value<C>(value: &Value<C>) -> Option<u128> {
     match &value.value {
-        ValueDef::Composite(Composite::Named(fields)) => {
+        ValueDef::Composite(composite) => find_tip_in_composite(composite),
+        ValueDef::Variant(variant) => find_tip_in_composite(&variant.values),
+        _ => None,
+    }
+}
+
+fn find_tip_in_composite<C>(composite: &Composite<C>) -> Option<u128> {
+    match composite {
+        Composite::Named(fields) => {
             for (name, val) in fields {
                 if name.eq_ignore_ascii_case("tip") {
                     if let Some(tip) = extract_u128(val) {
@@ -1505,26 +2258,18 @@ fn find_tip_in_value(value: &Value<()>) -> Option<u128> {
                 }
             }
         }
-        ValueDef::Composite(Composite::Unnamed(values)) => {
+        Composite::Unnamed(values) => {
             for val in values {
                 if let Some(tip) = find_tip_in_value(val) {
                     return Some(tip);
                 }
             }
         }
-        ValueDef::Variant(variant) => {
-            if let Some(tip) = find_tip_in_value(&Value::without_context(ValueDef::Composite(
-                variant.values.clone(),
-            ))) {
-                return Some(tip);
-            }
-        }
-        _ => {}
     }
     None
 }
 
-fn extract_u128(value: &Value<()>) -> Option<u128> {
+fn extract_u128<C>(value: &Value<C>) -> Option<u128> {
     match &value.value {
         ValueDef::Primitive(p) => p.as_u128().or_else(|| match p {
             scale_value::Primitive::U256(bytes) => {
